@@ -1,7 +1,8 @@
 package spray.contrib.socketio.examples
 
-import akka.io.IO
 import akka.actor.{ ActorSystem, Actor, Props, ActorLogging, ActorRef }
+import akka.contrib.pattern.DistributedPubSubMediator.Subscribe
+import akka.io.IO
 import akka.stream.actor.ActorPublisher
 import akka.stream.actor.ActorSubscriber
 import akka.stream.actor.ActorSubscriberMessage.OnNext
@@ -16,7 +17,6 @@ import spray.contrib.socketio.packet.EventPacket
 import spray.contrib.socketio.namespace.Channel
 import spray.contrib.socketio.namespace.Namespace
 import spray.contrib.socketio.namespace.Namespace.OnEvent
-import spray.contrib.socketio.namespace.NamespaceExtension
 import spray.http.{ HttpMethods, Uri, HttpEntity, ContentType, MediaTypes }
 import spray.http.HttpRequest
 import spray.http.HttpResponse
@@ -90,10 +90,9 @@ object SimpleServer extends App with MySslConfiguration {
 
   implicit val system = ActorSystem()
   val socketioExt = SocketIOExtension(system)
-  val namespaceExt = NamespaceExtension(system)
 
   class Receiver extends ActorSubscriber {
-    implicit val sessionRegion = socketioExt.sessionRegionClient
+    implicit val sessionClient = socketioExt.sessionClient
 
     override val requestStrategy = WatermarkRequestStrategy(10)
 
@@ -127,8 +126,8 @@ object SimpleServer extends App with MySslConfiguration {
   //  case _          => Observable.empty
   //}.subscribe(observer)
 
-  namespaceExt.startNamespace("testendpoint")
-  namespaceExt.namespace("testendpoint") ! Namespace.Subscribe("testendpoint", channel)
+  val namespaceClient = socketioExt.namespaceClient
+  namespaceClient ! Subscribe("testendpoint", channel)
 
   val sessionRegion = socketioExt.sessionRegion
   val server = system.actorOf(SocketIOServer.props(sessionRegion), name = "socketio-server")

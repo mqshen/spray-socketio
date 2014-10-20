@@ -10,7 +10,8 @@ import akka.util.ByteString
 import com.typesafe.config.ConfigFactory
 import spray.contrib.socketio.ConnectionSession._
 import spray.contrib.socketio.ConnectionContext
-import spray.contrib.socketio.packet.{ Packet, MessagePacket }
+import spray.contrib.socketio.namespace.Namespace
+import spray.contrib.socketio.packet.{ Packet, MessagePacket, ConnectPacket, DisconnectPacket, JsonPacket, EventPacket }
 import spray.can.websocket.frame.TextFrame
 import spray.contrib.socketio.transport
 import spray.http.Uri.Query
@@ -32,20 +33,22 @@ akka {
       packet = "spray.contrib.socketio.serializer.PacketSerializer"
       connctx = "spray.contrib.socketio.serializer.ConnectionContextSerializer"
       state = "spray.contrib.socketio.serializer.ConnectionSessionStateSerializer"
-      command = "spray.contrib.socketio.serializer.CommandSerializer"
+      conncmd = "spray.contrib.socketio.serializer.ConnectionSessionCommandSerializer"
       onpacket = "spray.contrib.socketio.serializer.OnPacketSerializer"
       onbroadcast = "spray.contrib.socketio.serializer.OnBroadcastSerializer"
       status = "spray.contrib.socketio.serializer.StatusSerializer"
+      ondata = "spray.contrib.socketio.serializer.OnDataSerializer"
     }
     serialization-bindings {
       "spray.can.websocket.frame.Frame" = frame
       "spray.contrib.socketio.packet.Packet" = packet
       "spray.contrib.socketio.ConnectionContext" = connctx
       "spray.contrib.socketio.ConnectionSession$State" = state
-      "spray.contrib.socketio.ConnectionSession$Command" = command
+      "spray.contrib.socketio.ConnectionSession$Command" = conncmd
       "spray.contrib.socketio.ConnectionSession$OnPacket" = onpacket
       "spray.contrib.socketio.ConnectionSession$OnBroadcast" = onbroadcast
       "spray.contrib.socketio.ConnectionSession$Status" = status
+      "spray.contrib.socketio.namespace.Namespace$OnData" = ondata
     }
   }
 }
@@ -80,6 +83,10 @@ akka {
   val testActorRef = system.actorOf(Props(classOf[Test_Actor], this))
   val deadleaters = system.deadLetters
 
+  val ctx = new ConnectionContext(sessionId, query, origins)
+  ctx.transport = transport.WebSocket
+  ctx.isConnected = true
+
   "Serializer" must {
     "handle Frame" in {
       val obj = TextFrame("hello world")
@@ -98,22 +105,16 @@ akka {
     }
 
     "handle ConnectionSessionState with actorRef" in {
-      val ctx = new ConnectionContext(sessionId, query, origins)
-      ctx.transport = transport.WebSocket
-      ctx.isConnected = true
       val obj = new State(ctx, testActorRef, immutable.Set("topic1, topic2"))
       test(obj)
     }
 
     "handle ConnectionSessionState with deadletters" in {
-      val ctx = new ConnectionContext(sessionId, query, origins)
-      ctx.transport = transport.WebSocket
-      ctx.isConnected = true
       val obj = new State(ctx, system.deadLetters, immutable.Set("topic1, topic2"))
       test(obj)
     }
 
-    "handle Command" when {
+    "handle ConnectionSession Command" when {
       "CreateSession" in {
         val obj = CreateSession(sessionId)
         test(obj)
@@ -206,5 +207,34 @@ akka {
         test(obj)
       }
     }
+
+    "handle Namespace Command/OnData" when {
+      "OnConnect" in {
+        val args = List(("a1", "v1"), ("a2", ""))
+        val obj = Namespace.OnConnect(args, ctx)(ConnectPacket("endpoint", args))
+        test(obj)
+      }
+
+      "OnDisconnect" in {
+        val obj = Namespace.OnDisconnect(ctx)(DisconnectPacket("endpoint"))
+        test(obj)
+      }
+
+      "OnMessage" in {
+        val obj = Namespace.OnMessage("msg", ctx)(MessagePacket(-1, false, "", "hello world"))
+        test(obj)
+      }
+
+      "OnJson" in {
+        val obj = Namespace.OnJson("json", ctx)(JsonPacket(-1, false, "", "hello world"))
+        test(obj)
+      }
+
+      "OnEvent" in {
+        val obj = Namespace.OnEvent("event", "1", ctx)(EventPacket(-1, false, "", "edwald", Seq("""{"a": "b"}""", "2", "3")))
+        test(obj)
+      }
+    }
+
   }
 }

@@ -2,7 +2,6 @@ package spray.contrib.socketio
 
 import akka.actor._
 import akka.contrib.pattern._
-import akka.cluster.Cluster
 import akka.dispatch.MonitorableThreadFactory
 import akka.event.Logging
 import akka.event.LoggingAdapter
@@ -15,7 +14,6 @@ import java.util.concurrent.TimeUnit
 import scala.collection.immutable
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.FiniteDuration
-import spray.contrib.socketio.namespace.DistributedBalancingPubSubProxy
 import spray.contrib.socketio.namespace.LocalNamespaceRegion
 import spray.contrib.socketio.namespace.Namespace
 
@@ -27,8 +25,6 @@ object SocketIOExtension extends ExtensionId[SocketIOExtension] with ExtensionId
   override def createExtension(system: ExtendedActorSystem): SocketIOExtension = new SocketIOExtension(system)
 
   val mediatorName: String = "socketioMediator"
-  val mediatorSingleton: String = "socketiosession"
-
 }
 
 class SocketIOExtension(system: ExtendedActorSystem) extends Extension {
@@ -38,19 +34,37 @@ class SocketIOExtension(system: ExtendedActorSystem) extends Extension {
    * INTERNAL API
    */
   private[socketio] object Settings {
-    val sessionRole: String = "connectionSession"
     val config = system.settings.config.getConfig("spray.socketio")
     val isCluster: Boolean = config.getString("mode") == "cluster"
     val enableSessionPersistence: Boolean = config.getBoolean("server.enable-connectionsession-persistence")
     val schedulerTickDuration: FiniteDuration = Duration(config.getDuration("scheduler.tick-duration", TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS)
     val schedulerTicksPerWheel: Int = config.getInt("scheduler.ticks-per-wheel")
-    val namespaceGroup = config.getString("server.namespace-group-name")
   }
 
-  lazy val connectionSessionProps: Props = if (Settings.enableSessionPersistence) {
-    PersistentConnectionSession.props(namespaceMediator, broadcastMediator)
+  private lazy val groupRoutingLogic = {
+    Settings.config.getString("routing-logic") match {
+      case "random"             => RandomRoutingLogic()
+      case "round-robin"        => RoundRobinRoutingLogic()
+      case "consistent-hashing" => ConsistentHashingRoutingLogic(system)
+      case "broadcast"          => BroadcastRoutingLogic()
+      case other                => throw new IllegalArgumentException(s"Unknown 'routing-logic': [$other]")
+    }
+  }
+
+  private lazy val localMediator = system.actorOf(LocalMediator.props(), name = SocketIOExtension.mediatorName)
+  private lazy val localSessionRegion = system.actorOf(LocalConnectionSessionRegion.props(TransientConnectionSession.props(localMediator)), name = ConnectionSession.shardName)
+  private lazy val localNamespaceRegion = system.actorOf(LocalNamespaceRegion.props(Namespace.props(localMediator, groupRoutingLogic)), name = Namespace.shardName)
+
+  lazy val mediator = if (Settings.isCluster) DistributedPubSubExtension(system).mediator else localMediator
+
+  lazy val sessionProps: Props = if (Settings.enableSessionPersistence) {
+    PersistentConnectionSession.props(mediator)
   } else {
-    TransientConnectionSession.props(namespaceMediator, broadcastMediator)
+    TransientConnectionSession.props(mediator)
+  }
+
+  lazy val namespaceProps: Props = {
+    Namespace.props(mediator, groupRoutingLogic)
   }
 
   lazy val clusterClient = {
@@ -59,66 +73,31 @@ class SocketIOExtension(system: ExtendedActorSystem) extends Extension {
     system.actorOf(ClusterClient.props(initialContacts map system.actorSelection), "socketio-cluster-client")
   }
 
-  lazy val localMediator = system.actorOf(LocalMediator.props(), name = SocketIOExtension.mediatorName)
-
-  lazy val localSessionRegion = system.actorOf(LocalConnectionSessionRegion.props(localMediator, connectionSessionProps), name = ConnectionSession.shardName)
-  lazy val localNamespaceRegion = system.actorOf(LocalNamespaceRegion.props(localMediator), name = Namespace.shardName)
-
-  /** No lazy, need to start immediately to accept broadcast etc. */
-  val broadcastMediator = if (Settings.isCluster) DistributedPubSubExtension(system).mediator else localMediator
-
   /**
-   * No lazy, need to start immediately to accept subscriptions msg etc.
-   * namespaceMediator is used by client outside of cluster.
+   * Should start sharding before by: ConnectionSession.startSharding(system, Option[sessionProps])
    */
-  val namespaceMediator = if (Settings.isCluster) {
-    val cluster = Cluster(system)
-    if (cluster.getSelfRoles.contains(Settings.sessionRole)) {
-      val routingLogic = Settings.config.getString("routing-logic") match {
-        case "random"             => RandomRoutingLogic()
-        case "round-robin"        => RoundRobinRoutingLogic()
-        case "consistent-hashing" => ConsistentHashingRoutingLogic(system)
-        case "broadcast"          => BroadcastRoutingLogic()
-        case other                => throw new IllegalArgumentException(s"Unknown 'routing-logic': [$other]")
-      }
-      val mediator = system.actorOf(DistributedBalancingPubSubMediator.props(Some(Settings.sessionRole), routingLogic), name = SocketIOExtension.mediatorName)
-      ClusterReceptionistExtension(system).registerService(mediator)
-      mediator
-    } else {
-      system.deadLetters
-    }
-  } else localMediator
-
-  lazy val mediatorProxy = if (Settings.isCluster) {
-    system.actorOf(DistributedBalancingPubSubProxy.props(s"/user/${SocketIOExtension.mediatorName}", Settings.namespaceGroup, clusterClient))
-  } else {
-    localMediator
-  }
-
-  if (Settings.isCluster) {
-    ConnectionSession.startSharding(system, connectionSessionProps)
-    //Namespace.startSharding(system, Namespace.props(mediatorProxy))
-  }
-
   lazy val sessionRegion = if (Settings.isCluster) {
     ClusterSharding(system).shardRegion(ConnectionSession.shardName)
   } else {
     localSessionRegion
   }
 
+  /**
+   * Should start sharding before by: Namespace.startSharding(system, Option[namespcaeProps])
+   */
   lazy val namespaceRegion = if (Settings.isCluster) {
     ClusterSharding(system).shardRegion(Namespace.shardName)
   } else {
     localNamespaceRegion
   }
 
-  lazy val sessionRegionClient = if (Settings.isCluster) {
+  lazy val sessionClient = if (Settings.isCluster) {
     ConnectionSession(system).clusterClient
   } else {
     localSessionRegion
   }
 
-  lazy val namespaceRegionClient = if (Settings.isCluster) {
+  lazy val namespaceClient = if (Settings.isCluster) {
     Namespace(system).clusterClient
   } else {
     localNamespaceRegion

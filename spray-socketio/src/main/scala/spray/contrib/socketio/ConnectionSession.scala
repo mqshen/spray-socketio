@@ -99,22 +99,23 @@ object ConnectionSession {
    * system is started by defining it in the akka.extensions configuration property:
    *   akka.extensions = ["akka.contrib.pattern.ClusterReceptionistExtension"]
    */
-  def startSharding(system: ActorSystem, entryProps: Props) {
+  def startSharding(system: ActorSystem, entryProps: Option[Props]) {
     val sharding = ClusterSharding(system)
     sharding.start(
-      entryProps = Some(entryProps),
+      entryProps = entryProps,
       typeName = shardName,
       idExtractor = idExtractor,
       shardResolver = shardResolver)
-    ClusterReceptionistExtension(system).registerService(sharding.shardRegion(shardName))
+    if (entryProps.isDefined) ClusterReceptionistExtension(system).registerService(sharding.shardRegion(shardName))
   }
 
   final class SystemSingletons(system: ActorSystem) {
     lazy val clusterClient = {
+      startSharding(system, None)
       val shardingGuardianName = system.settings.config.getString("akka.contrib.cluster.sharding.guardian-name")
       val path = s"/user/${shardingGuardianName}/${shardName}"
       val originalClusterClient = SocketIOExtension(system).clusterClient
-      system.actorOf(Props(classOf[ProxiedClusterClient], path, originalClusterClient))
+      system.actorOf(Props(classOf[ClusterClientBroker], path, originalClusterClient))
     }
   }
 
@@ -138,12 +139,12 @@ object ConnectionSession {
   }
 
   /**
-   * A proxy actor that runs on the business nodes to make forwarding msg to ConnectionSession easily.
+   * A broker actor that runs on the business nodes to make forwarding msg to ConnectionSession easily.
    *
    * @param path ConnectionSession sharding service's path
    * @param client [[ClusterClient]] to access SocketIO Cluster
    */
-  class ProxiedClusterClient(shardingServicePath: String, originalClient: ActorRef) extends Actor with ActorLogging {
+  class ClusterClientBroker(shardingServicePath: String, originalClient: ActorRef) extends Actor with ActorLogging {
     def receive: Actor.Receive = {
       case cmd: ConnectionSession.Command => originalClient forward ClusterClient.Send(shardingServicePath, cmd, false)
     }
@@ -186,8 +187,7 @@ trait ConnectionSession { _: Actor =>
 
   def log: LoggingAdapter
 
-  def namespaceMediator: ActorRef
-  def broadcastMediator: ActorRef
+  def mediator: ActorRef
 
   def recoveryFinished: Boolean
   def recoveryRunning: Boolean
@@ -467,23 +467,23 @@ trait ConnectionSession { _: Actor =>
   }
 
   def publishDisconnect(ctx: ConnectionContext) {
-    namespaceMediator ! Publish(socketio.topicForDisconnect, OnPacket(GlobalDisconnectPacket, ctx))
+    mediator ! Publish(socketio.topicForDisconnect, OnPacket(GlobalDisconnectPacket, ctx))
   }
 
   def publishToNamespace[T <: Packet](msg: OnPacket[T]) {
-    namespaceMediator ! Publish(socketio.topicForNamespace(msg.packet.endpoint), msg, sendOneMessageToEachGroup = false)
+    mediator ! Publish(socketio.topicForNamespace(msg.packet.endpoint), msg, sendOneMessageToEachGroup = false)
   }
 
   def publishToBroadcast(msg: OnBroadcast) {
-    broadcastMediator ! Publish(socketio.topicForBroadcast(msg.packet.endpoint, msg.room), msg, sendOneMessageToEachGroup = false)
+    mediator ! Publish(socketio.topicForBroadcast(msg.packet.endpoint, msg.room), msg, sendOneMessageToEachGroup = false)
   }
 
   def subscribeBroadcast(topic: String): Future[SubscribeAck] = {
-    broadcastMediator.ask(Subscribe(topic, self))(socketio.actorResolveTimeout).mapTo[SubscribeAck]
+    mediator.ask(Subscribe(topic, self))(socketio.actorResolveTimeout).mapTo[SubscribeAck]
   }
 
   def unsubscribeBroadcast(topic: String) {
-    broadcastMediator ! Unsubscribe(topic, self)
+    mediator ! Unsubscribe(topic, self)
   }
 
   // ---- heartbeat and timeout
